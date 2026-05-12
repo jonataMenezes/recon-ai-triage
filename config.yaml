@@ -1,0 +1,53 @@
+llm:
+  enabled: true
+  model: "gpt-4.1-mini"
+  api_key_env: "OPENAI_API_KEY"
+
+scoring:
+  interesting_threshold: 40
+  vuln_threshold: 70
+
+noise:
+  status_codes: [404, 400, 301, 302]
+  extensions: [".png", ".jpg", ".jpeg", ".gif", ".css", ".ico", ".svg", ".woff", ".woff2"]
+
+keywords:
+  high:
+    - admin
+    - backup
+    - debug
+    - staging
+    - dev
+    - test
+    - internal
+    - config
+    - secrets
+    - token
+    - jwt
+    - api_key
+    - password
+    - passwd
+    - dump
+    - sql
+    - phpinfo
+    - swagger
+    - openapi
+    - graphql
+    - actuator
+    - env
+    - git
+
+  medium:
+    - login
+    - upload
+    - export
+    - import
+    - redirect
+    - callback
+    - webhook
+    - file
+    - download
+    - report
+    - invoice
+    - user
+    - id
