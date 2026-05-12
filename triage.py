@@ -1,9 +1,13 @@
+# Recon AI Triage - v1.1.0
+# Features: Nmap, FFUF, logs, scoring, correlation engine, optional LLM, optional CVE enrichment
+
 import os
 import re
-import sys
 import json
 import yaml
 import argparse
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree as ET
@@ -31,6 +35,16 @@ def normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).lower()
+
+
+def classify(score: int, config: Dict[str, Any]) -> str:
+    if score >= config["scoring"]["vuln_threshold"]:
+        return "potencial_vulnerabilidade"
+
+    if score >= config["scoring"]["interesting_threshold"]:
+        return "interessante"
+
+    return "ruido"
 
 
 def calculate_score(item: Finding, config: Dict[str, Any]) -> Finding:
@@ -118,7 +132,7 @@ def calculate_score(item: Finding, config: Dict[str, Any]) -> Finding:
         score += 15
         reasons.append(f"Porta aberta detectada: {port}")
 
-    if version or product:
+    if version or item.get("product"):
         score += 15
         reasons.append("Banner/versionamento exposto")
 
@@ -130,32 +144,138 @@ def calculate_score(item: Finding, config: Dict[str, Any]) -> Finding:
         score += 20
         reasons.append("OpenSSH antigo detectado")
 
-    classification = classify(score, config)
-
     return {
         "score": min(score, 100),
-        "classification": classification,
+        "classification": classify(score, config),
         "reasons": reasons
     }
 
 
-def classify(score: int, config: Dict[str, Any]) -> str:
-    if score >= config["scoring"]["vuln_threshold"]:
-        return "potencial_vulnerabilidade"
+def build_cve_query(product: str, version: str) -> Optional[str]:
+    product_l = normalize_text(product)
+    version_l = normalize_text(version)
 
-    if score >= config["scoring"]["interesting_threshold"]:
-        return "interessante"
+    if not product_l:
+        return None
 
-    return "ruido"
+    if "apache" in product_l:
+        return f"Apache httpd {version_l}".strip()
+
+    if "openssh" in product_l:
+        return f"OpenSSH {version_l}".strip()
+
+    if "nginx" in product_l:
+        return f"nginx {version_l}".strip()
+
+    if "mysql" in product_l:
+        return f"MySQL {version_l}".strip()
+
+    if "postgres" in product_l:
+        return f"PostgreSQL {version_l}".strip()
+
+    if "redis" in product_l:
+        return f"Redis {version_l}".strip()
+
+    if "mongodb" in product_l:
+        return f"MongoDB {version_l}".strip()
+
+    return f"{product} {version}".strip()
+
+
+def fetch_cves_nvd(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    encoded = urllib.parse.urlencode({
+        "keywordSearch": query,
+        "cvssV3Severity": "HIGH"
+    })
+
+    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?{encoded}"
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Recon-AI-Triage/1.1"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            data = json.loads(response.read().decode("utf-8", errors="ignore"))
+    except Exception as e:
+        return [{
+            "error": str(e),
+            "query": query
+        }]
+
+    results = []
+
+    for vuln in data.get("vulnerabilities", [])[:limit]:
+        cve = vuln.get("cve", {})
+        metrics = cve.get("metrics", {})
+
+        cvss_score = None
+        severity = None
+
+        if "cvssMetricV31" in metrics:
+            cvss = metrics["cvssMetricV31"][0]["cvssData"]
+            cvss_score = cvss.get("baseScore")
+            severity = cvss.get("baseSeverity")
+        elif "cvssMetricV30" in metrics:
+            cvss = metrics["cvssMetricV30"][0]["cvssData"]
+            cvss_score = cvss.get("baseScore")
+            severity = cvss.get("baseSeverity")
+
+        description = ""
+        for desc in cve.get("descriptions", []):
+            if desc.get("lang") == "en":
+                description = desc.get("value")
+                break
+
+        results.append({
+            "id": cve.get("id"),
+            "published": cve.get("published"),
+            "lastModified": cve.get("lastModified"),
+            "severity": severity,
+            "cvss": cvss_score,
+            "description": description[:500],
+            "references": [
+                ref.get("url") for ref in cve.get("references", {}).get("referenceData", [])
+            ][:5]
+        })
+
+    return results
+
+
+def apply_cve_enrichment(findings: List[Finding], config: Dict[str, Any]) -> List[Finding]:
+    cache = {}
+
+    for item in findings:
+        product = item.get("product")
+        version = item.get("version")
+
+        if not product:
+            continue
+
+        query = build_cve_query(product, version or "")
+
+        if not query:
+            continue
+
+        if query not in cache:
+            cache[query] = fetch_cves_nvd(query)
+
+        cves = cache[query]
+        item["cve_query"] = query
+        item["cves"] = cves
+
+        valid_cves = [c for c in cves if c.get("id")]
+
+        if valid_cves:
+            item["score"] = min(item.get("score", 0) + 20, 100)
+            item["reasons"].append(f"CVE enrichment encontrou {len(valid_cves)} CVEs HIGH relacionadas")
+            item["classification"] = classify(item["score"], config)
+
+    return sorted(findings, key=lambda x: x.get("score", 0), reverse=True)
 
 
 def apply_correlation_engine(findings: List[Finding], config: Dict[str, Any]) -> List[Finding]:
-    """
-    Correlation Engine:
-    Cruza achados e aumenta score quando padrões combinados aparecem.
-    Isso reduz ruído e destaca superfícies promissoras.
-    """
-
     all_text = normalize_text(json.dumps(findings, ensure_ascii=False))
 
     has_admin = any(re.search(r"(admin|dashboard|manager)", normalize_text(f)) for f in findings)
@@ -178,7 +298,7 @@ def apply_correlation_engine(findings: List[Finding], config: Dict[str, Any]) ->
         correlations.append({
             "name": "Painel administrativo protegido detectado",
             "boost": 20,
-            "reason": "Admin/dashboard com 401/403 pode indicar superfície com bypass, bruteforce controlado ou enumeração."
+            "reason": "Admin/dashboard com 401/403 pode indicar superfície com bypass ou enumeração."
         })
 
     if has_swagger:
@@ -199,7 +319,7 @@ def apply_correlation_engine(findings: List[Finding], config: Dict[str, Any]) ->
         correlations.append({
             "name": "Upload + superfície de objeto/usuário",
             "boost": 25,
-            "reason": "Combinação interessante para IDOR, upload abuse, file overwrite ou acesso indevido."
+            "reason": "Combinação relevante para IDOR, upload abuse, overwrite ou acesso indevido."
         })
 
     if has_redirect and has_403:
@@ -213,14 +333,14 @@ def apply_correlation_engine(findings: List[Finding], config: Dict[str, Any]) ->
         correlations.append({
             "name": "Erros server-side detectados",
             "boost": 20,
-            "reason": "Erros 5xx durante recon indicam possível falha de parsing, stack trace ou vetor de fuzzing."
+            "reason": "Erros 5xx indicam possível falha de parsing, stack trace ou vetor de fuzzing."
         })
 
     if has_sensitive_file:
         correlations.append({
             "name": "Possível arquivo sensível exposto",
             "boost": 30,
-            "reason": "Arquivos como .env, .git, backups e dumps são altamente relevantes em Bug Bounty."
+            "reason": "Arquivos como .env, .git, backups e dumps são altamente relevantes."
         })
 
     if "22" in open_ports and "80" in open_ports:
@@ -246,7 +366,6 @@ def apply_correlation_engine(findings: List[Finding], config: Dict[str, Any]) ->
 
     for item in findings:
         item_text = normalize_text(item)
-
         item["correlations"] = []
 
         for corr in correlations:
@@ -283,10 +402,9 @@ def parse_ffuf_json(path: str) -> List[Finding]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         data = json.load(f)
 
-    results = data.get("results", [])
     findings = []
 
-    for r in results:
+    for r in data.get("results", []):
         findings.append({
             "source": "ffuf",
             "url": r.get("url"),
@@ -376,12 +494,10 @@ def parse_generic_log(path: str) -> List[Finding]:
 
 
 def detect_file_type(path: str) -> str:
-    p = path.lower()
-
-    if p.endswith(".json"):
+    if path.lower().endswith(".json"):
         return "ffuf_json"
 
-    if p.endswith(".xml"):
+    if path.lower().endswith(".xml"):
         return "nmap_xml"
 
     return "generic_log"
@@ -445,19 +561,25 @@ Item:
         return {"llm_error": str(e)}
 
 
-def enrich_findings(findings: List[Finding], config: Dict[str, Any], use_llm: bool) -> List[Finding]:
+def enrich_findings(
+    findings: List[Finding],
+    config: Dict[str, Any],
+    use_llm: bool,
+    use_cve: bool
+) -> List[Finding]:
     enriched = []
 
     for item in findings:
         local = calculate_score(item, config)
-
         item["score"] = local["score"]
         item["classification"] = local["classification"]
         item["reasons"] = local["reasons"]
-
         enriched.append(item)
 
     enriched = apply_correlation_engine(enriched, config)
+
+    if use_cve:
+        enriched = apply_cve_enrichment(enriched, config)
 
     if use_llm:
         for item in enriched:
@@ -498,6 +620,12 @@ def write_markdown(findings: List[Finding], output: str):
             if item.get("service"):
                 f.write(f"- Service: `{item.get('service')}`\n")
 
+            if item.get("product"):
+                f.write(f"- Product: `{item.get('product')}`\n")
+
+            if item.get("version"):
+                f.write(f"- Version: `{item.get('version')}`\n")
+
             if item.get("url"):
                 f.write(f"- URL: `{item.get('url')}`\n")
 
@@ -514,6 +642,21 @@ def write_markdown(findings: List[Finding], output: str):
 
                 for corr in item["correlations"]:
                     f.write(f"- **{corr['name']}**: {corr['reason']}\n")
+
+            if item.get("cves"):
+                f.write("\n### CVE Enrichment\n\n")
+                f.write(f"- Query: `{item.get('cve_query')}`\n\n")
+
+                for cve in item["cves"]:
+                    if cve.get("id"):
+                        f.write(f"- **{cve.get('id')}**")
+                        if cve.get("severity") or cve.get("cvss"):
+                            f.write(f" — {cve.get('severity')} / CVSS {cve.get('cvss')}")
+                        f.write("\n")
+                        if cve.get("description"):
+                            f.write(f"  - {cve.get('description')}\n")
+                    elif cve.get("error"):
+                        f.write(f"- Erro ao consultar CVE: `{cve.get('error')}`\n")
 
             f.write("\n### JSON bruto\n\n")
             f.write("```json\n")
@@ -550,6 +693,7 @@ def main():
     parser.add_argument("-o", "--output", default="outputs/findings.json", help="Saída JSON")
     parser.add_argument("--markdown", default="outputs/findings.md", help="Saída Markdown")
     parser.add_argument("--no-llm", action="store_true", help="Desabilita análise por LLM")
+    parser.add_argument("--cve", action="store_true", help="Ativa enriquecimento CVE via NVD")
 
     args = parser.parse_args()
 
@@ -564,7 +708,9 @@ def main():
         findings = parse_generic_log(args.input)
 
     use_llm = not args.no_llm
-    enriched = enrich_findings(findings, config, use_llm)
+    use_cve = args.cve
+
+    enriched = enrich_findings(findings, config, use_llm, use_cve)
 
     Path("outputs").mkdir(exist_ok=True)
 
