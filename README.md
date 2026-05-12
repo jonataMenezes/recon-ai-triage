@@ -1,7 +1,4 @@
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jonataMenezes/recon-ai-triage/main/assets/banner.png" width="900">
-</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue">
