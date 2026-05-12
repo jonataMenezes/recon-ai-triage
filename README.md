@@ -3,6 +3,13 @@
   <img src="https://raw.githubusercontent.com/jonataMenezes/recon-ai-triage/main/assets/banner.png" width="900">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue">
+  <img src="https://img.shields.io/badge/status-active-success">
+  <img src="https://img.shields.io/badge/license-MIT-green">
+  <img src="https://img.shields.io/badge/focus-bugbounty-red">
+</p>
+
 
 # Recon AI Triage
 
@@ -47,6 +54,8 @@ python triage.py -i inputs/nmap.xml --no-llm
 cat outputs/findings.md
 cat outputs/findings.json
 ```
+
+![Demo](assets/demo.png)
 
 ## Security Notice
 
