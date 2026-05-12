@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import yaml
 import argparse
@@ -18,7 +19,12 @@ Finding = Dict[str, Any]
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+
+    if not config:
+        raise ValueError("config.yaml vazio ou inválido.")
+
+    return config
 
 
 def normalize_text(value: Any) -> str:
@@ -27,26 +33,24 @@ def normalize_text(value: Any) -> str:
     return str(value).lower()
 
 
-def calculate_score(item: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+def calculate_score(item: Finding, config: Dict[str, Any]) -> Finding:
     score = 0
     reasons = []
 
     text = normalize_text(json.dumps(item, ensure_ascii=False))
 
-    high_keywords = config["keywords"]["high"]
-    medium_keywords = config["keywords"]["medium"]
-
-    for kw in high_keywords:
+    for kw in config["keywords"]["high"]:
         if kw.lower() in text:
             score += 20
             reasons.append(f"Keyword crítica encontrada: {kw}")
 
-    for kw in medium_keywords:
+    for kw in config["keywords"]["medium"]:
         if kw.lower() in text:
             score += 8
             reasons.append(f"Keyword interessante encontrada: {kw}")
 
     status = item.get("status") or item.get("status_code")
+
     try:
         status = int(status)
     except Exception:
@@ -70,7 +74,7 @@ def calculate_score(item: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, A
         "Possível exposição de arquivo .env": r"\.env($|\?)",
         "Possível exposição de Git": r"\.git",
         "Possível Swagger/OpenAPI exposto": r"(swagger|openapi|api-docs)",
-        "Possível actuator exposto": r"actuator",
+        "Possível Actuator exposto": r"actuator",
         "Possível painel administrativo": r"(admin|dashboard|manager)",
         "Possível backup exposto": r"(backup|\.bak|\.old|\.zip|\.tar|\.gz|dump)",
         "Possível endpoint de upload": r"(upload|file)",
@@ -86,6 +90,8 @@ def calculate_score(item: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, A
 
     port = item.get("port")
     service = normalize_text(item.get("service"))
+    product = normalize_text(item.get("product"))
+    version = normalize_text(item.get("version"))
 
     risky_ports = {
         "21": "FTP exposto",
@@ -108,22 +114,169 @@ def calculate_score(item: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, A
         score += 20
         reasons.append(f"Serviço sensível detectado: {service}")
 
-    if "version" in item and item["version"]:
-        score += 10
+    if port and item.get("state") == "open":
+        score += 15
+        reasons.append(f"Porta aberta detectada: {port}")
+
+    if version or product:
+        score += 15
         reasons.append("Banner/versionamento exposto")
 
-    if score >= config["scoring"]["vuln_threshold"]:
-        classification = "potencial_vulnerabilidade"
-    elif score >= config["scoring"]["interesting_threshold"]:
-        classification = "interessante"
-    else:
-        classification = "ruido"
+    if "apache" in product and "2.4.7" in version:
+        score += 20
+        reasons.append("Apache antigo detectado")
+
+    if "openssh" in product and "6.6" in version:
+        score += 20
+        reasons.append("OpenSSH antigo detectado")
+
+    classification = classify(score, config)
 
     return {
         "score": min(score, 100),
         "classification": classification,
         "reasons": reasons
     }
+
+
+def classify(score: int, config: Dict[str, Any]) -> str:
+    if score >= config["scoring"]["vuln_threshold"]:
+        return "potencial_vulnerabilidade"
+
+    if score >= config["scoring"]["interesting_threshold"]:
+        return "interessante"
+
+    return "ruido"
+
+
+def apply_correlation_engine(findings: List[Finding], config: Dict[str, Any]) -> List[Finding]:
+    """
+    Correlation Engine:
+    Cruza achados e aumenta score quando padrões combinados aparecem.
+    Isso reduz ruído e destaca superfícies promissoras.
+    """
+
+    all_text = normalize_text(json.dumps(findings, ensure_ascii=False))
+
+    has_admin = any(re.search(r"(admin|dashboard|manager)", normalize_text(f)) for f in findings)
+    has_403 = any(str(f.get("status")) == "403" for f in findings)
+    has_401 = any(str(f.get("status")) == "401" for f in findings)
+    has_swagger = "swagger" in all_text or "openapi" in all_text or "api-docs" in all_text
+    has_graphql = "graphql" in all_text
+    has_upload = "upload" in all_text
+    has_redirect = "redirect" in all_text or "callback" in all_text or "returnurl" in all_text
+    has_idor_surface = any(re.search(r"(user|account|invoice|order|profile|id=|uuid=)", normalize_text(f)) for f in findings)
+    has_server_error = any(str(f.get("status")) in ["500", "502", "503"] for f in findings)
+    has_sensitive_file = any(re.search(r"(\.env|\.git|backup|dump|\.bak|\.old|\.zip|\.tar|\.gz)", normalize_text(f)) for f in findings)
+
+    open_ports = {str(f.get("port")) for f in findings if f.get("state") == "open"}
+    services = normalize_text(" ".join([str(f.get("service", "")) for f in findings]))
+
+    correlations = []
+
+    if has_admin and (has_403 or has_401):
+        correlations.append({
+            "name": "Painel administrativo protegido detectado",
+            "boost": 20,
+            "reason": "Admin/dashboard com 401/403 pode indicar superfície com bypass, bruteforce controlado ou enumeração."
+        })
+
+    if has_swagger:
+        correlations.append({
+            "name": "Documentação de API exposta",
+            "boost": 25,
+            "reason": "Swagger/OpenAPI pode revelar endpoints, parâmetros e fluxos internos."
+        })
+
+    if has_graphql:
+        correlations.append({
+            "name": "GraphQL detectado",
+            "boost": 25,
+            "reason": "GraphQL pode permitir introspection, IDOR, BOLA e enumeração de schema."
+        })
+
+    if has_upload and has_idor_surface:
+        correlations.append({
+            "name": "Upload + superfície de objeto/usuário",
+            "boost": 25,
+            "reason": "Combinação interessante para IDOR, upload abuse, file overwrite ou acesso indevido."
+        })
+
+    if has_redirect and has_403:
+        correlations.append({
+            "name": "Redirect/callback + recurso protegido",
+            "boost": 20,
+            "reason": "Pode indicar open redirect, OAuth abuse, bypass de autorização ou SSRF indireto."
+        })
+
+    if has_server_error:
+        correlations.append({
+            "name": "Erros server-side detectados",
+            "boost": 20,
+            "reason": "Erros 5xx durante recon indicam possível falha de parsing, stack trace ou vetor de fuzzing."
+        })
+
+    if has_sensitive_file:
+        correlations.append({
+            "name": "Possível arquivo sensível exposto",
+            "boost": 30,
+            "reason": "Arquivos como .env, .git, backups e dumps são altamente relevantes em Bug Bounty."
+        })
+
+    if "22" in open_ports and "80" in open_ports:
+        correlations.append({
+            "name": "SSH + HTTP no mesmo host",
+            "boost": 10,
+            "reason": "Pode indicar servidor tradicional com stack web e acesso administrativo exposto."
+        })
+
+    if any(p in open_ports for p in ["3306", "5432", "6379", "27017", "9200"]):
+        correlations.append({
+            "name": "Serviço de banco/cache/search exposto",
+            "boost": 35,
+            "reason": "Portas de dados expostas costumam ter alto impacto se mal configuradas."
+        })
+
+    if "smtp" in services or "25" in open_ports:
+        correlations.append({
+            "name": "SMTP detectado",
+            "boost": 15,
+            "reason": "Pode ser útil para testar spoofing, enumeração, relay incorreto ou exposição de banner."
+        })
+
+    for item in findings:
+        item_text = normalize_text(item)
+
+        item["correlations"] = []
+
+        for corr in correlations:
+            applies = False
+
+            if "admin" in item_text or "dashboard" in item_text or "manager" in item_text:
+                applies = True
+            if "swagger" in item_text or "openapi" in item_text or "api-docs" in item_text:
+                applies = True
+            if "graphql" in item_text:
+                applies = True
+            if "upload" in item_text or "file" in item_text:
+                applies = True
+            if "redirect" in item_text or "callback" in item_text:
+                applies = True
+            if re.search(r"(\.env|\.git|backup|dump|\.bak|\.old|\.zip|\.tar|\.gz)", item_text):
+                applies = True
+            if str(item.get("status")) in ["401", "403", "500", "502", "503"]:
+                applies = True
+            if item.get("state") == "open":
+                applies = True
+
+            if applies:
+                item["score"] = min(item.get("score", 0) + corr["boost"], 100)
+                item["reasons"].append(f"Correlação: {corr['name']}")
+                item["correlations"].append(corr)
+
+        item["classification"] = classify(item.get("score", 0), config)
+
+    return sorted(findings, key=lambda x: x.get("score", 0), reverse=True)
 
 
 def parse_ffuf_json(path: str) -> List[Finding]:
@@ -172,6 +325,8 @@ def parse_nmap_xml(path: str) -> List[Finding]:
             service = service_el.attrib.get("name") if service_el is not None else None
             product = service_el.attrib.get("product") if service_el is not None else None
             version = service_el.attrib.get("version") if service_el is not None else None
+            extrainfo = service_el.attrib.get("extrainfo") if service_el is not None else None
+            cpe_items = [cpe.text for cpe in service_el.findall("cpe")] if service_el is not None else []
 
             if state == "open":
                 findings.append({
@@ -183,6 +338,8 @@ def parse_nmap_xml(path: str) -> List[Finding]:
                     "service": service,
                     "product": product,
                     "version": version,
+                    "extrainfo": extrainfo,
+                    "cpe": cpe_items
                 })
 
     return findings
@@ -194,11 +351,13 @@ def parse_generic_log(path: str) -> List[Finding]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
+
             if not line:
                 continue
 
             status = None
             status_match = re.search(r"\s([1-5][0-9]{2})\s", f" {line} ")
+
             if status_match:
                 status = int(status_match.group(1))
 
@@ -238,6 +397,7 @@ def llm_analyze(finding: Finding, config: Dict[str, Any]) -> Optional[Dict[str, 
         return None
 
     api_key = os.getenv(llm_cfg.get("api_key_env", "OPENAI_API_KEY"))
+
     if not api_key:
         return None
 
@@ -246,7 +406,7 @@ def llm_analyze(finding: Finding, config: Dict[str, Any]) -> Optional[Dict[str, 
     prompt = f"""
 Você é um analista de segurança ofensiva em Bug Bounty.
 
-Analise este item de recon e diga se é:
+Analise este item de recon e classifique como:
 - ruido
 - interessante
 - potencial_vulnerabilidade
@@ -264,7 +424,7 @@ Item:
             messages=[
                 {
                     "role": "system",
-                    "content": "Você classifica outputs de recon com foco em Bug Bounty. Não invente fatos, mas levante hipóteses plausíveis."
+                    "content": "Você classifica outputs de recon com foco em Bug Bounty. Levante hipóteses plausíveis sem inventar fatos."
                 },
                 {
                     "role": "user",
@@ -295,10 +455,14 @@ def enrich_findings(findings: List[Finding], config: Dict[str, Any], use_llm: bo
         item["classification"] = local["classification"]
         item["reasons"] = local["reasons"]
 
-        if use_llm and item["classification"] != "ruido":
-            item["llm_analysis"] = llm_analyze(item, config)
-
         enriched.append(item)
+
+    enriched = apply_correlation_engine(enriched, config)
+
+    if use_llm:
+        for item in enriched:
+            if item["classification"] != "ruido":
+                item["llm_analysis"] = llm_analyze(item, config)
 
     return sorted(enriched, key=lambda x: x.get("score", 0), reverse=True)
 
@@ -312,14 +476,71 @@ def write_markdown(findings: List[Finding], output: str):
     with open(output, "w", encoding="utf-8") as f:
         f.write("# Recon AI Triage\n\n")
 
-        for item in findings:
-            if item.get("classification") == "ruido":
-                continue
+        visible = [x for x in findings if x.get("classification") != "ruido"]
 
+        if not visible:
+            f.write("Nenhum achado acima do threshold atual.\n\n")
+            f.write("Dica: reduza `interesting_threshold` no config.yaml para visualizar mais sinais.\n")
+            return
+
+        for item in visible:
             f.write(f"## {item.get('classification')} — Score {item.get('score')}\n\n")
+
+            f.write("### Resumo\n\n")
+            f.write(f"- Source: `{item.get('source')}`\n")
+
+            if item.get("host"):
+                f.write(f"- Host: `{item.get('host')}`\n")
+
+            if item.get("port"):
+                f.write(f"- Port: `{item.get('port')}`\n")
+
+            if item.get("service"):
+                f.write(f"- Service: `{item.get('service')}`\n")
+
+            if item.get("url"):
+                f.write(f"- URL: `{item.get('url')}`\n")
+
+            if item.get("status"):
+                f.write(f"- Status: `{item.get('status')}`\n")
+
+            f.write("\n### Motivos\n\n")
+
+            for reason in item.get("reasons", []):
+                f.write(f"- {reason}\n")
+
+            if item.get("correlations"):
+                f.write("\n### Correlações\n\n")
+
+                for corr in item["correlations"]:
+                    f.write(f"- **{corr['name']}**: {corr['reason']}\n")
+
+            f.write("\n### JSON bruto\n\n")
             f.write("```json\n")
             f.write(json.dumps(item, ensure_ascii=False, indent=2))
             f.write("\n```\n\n")
+
+
+def print_summary(findings: List[Finding], output: str, markdown: str):
+    total = len(findings)
+    vuln = len([x for x in findings if x["classification"] == "potencial_vulnerabilidade"])
+    interesting = len([x for x in findings if x["classification"] == "interessante"])
+    noise = len([x for x in findings if x["classification"] == "ruido"])
+
+    print(f"[+] Total analisado: {total}")
+    print(f"[+] Potenciais vulnerabilidades: {vuln}")
+    print(f"[+] Interessantes: {interesting}")
+    print(f"[+] Ruído: {noise}")
+    print(f"[+] JSON salvo em: {output}")
+    print(f"[+] Markdown salvo em: {markdown}")
+
+    top = [x for x in findings if x["classification"] != "ruido"][:5]
+
+    if top:
+        print("\n[+] Top findings:")
+        for item in top:
+            label = item.get("url") or f"{item.get('host')}:{item.get('port')}"
+            print(f"    - {item['classification']} | score={item['score']} | {label}")
 
 
 def main():
@@ -329,6 +550,7 @@ def main():
     parser.add_argument("-o", "--output", default="outputs/findings.json", help="Saída JSON")
     parser.add_argument("--markdown", default="outputs/findings.md", help="Saída Markdown")
     parser.add_argument("--no-llm", action="store_true", help="Desabilita análise por LLM")
+
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -348,18 +570,7 @@ def main():
 
     write_json(enriched, args.output)
     write_markdown(enriched, args.markdown)
-
-    total = len(enriched)
-    vuln = len([x for x in enriched if x["classification"] == "potencial_vulnerabilidade"])
-    interesting = len([x for x in enriched if x["classification"] == "interessante"])
-    noise = len([x for x in enriched if x["classification"] == "ruido"])
-
-    print(f"[+] Total analisado: {total}")
-    print(f"[+] Potenciais vulnerabilidades: {vuln}")
-    print(f"[+] Interessantes: {interesting}")
-    print(f"[+] Ruído: {noise}")
-    print(f"[+] JSON salvo em: {args.output}")
-    print(f"[+] Markdown salvo em: {args.markdown}")
+    print_summary(enriched, args.output, args.markdown)
 
 
 if __name__ == "__main__":
